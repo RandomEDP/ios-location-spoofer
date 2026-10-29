@@ -39,7 +39,7 @@ var spoofingEnabled bool = false
 
 // 诊断日志环形缓冲:最近 maxLogEntries 条 logEvent 调用,带时间戳。
 // drainlogs 导出函数返回缓冲内容(C 串)给 Tunnel→App 诊断面板,clear 缓冲。
-const maxLogEntries = 200
+const maxLogEntries = 400
 
 var logBuffer = make([]string, 0, maxLogEntries)
 var logBufferMu sync.Mutex
@@ -55,6 +55,23 @@ func logEvent(msg string) {
 	logBufferMu.Unlock()
 	// 同步写一份到 stderr(开发环境 Mac+Console.app 可见),保留原日志通路
 	log.Printf("%s", msg)
+}
+
+// goproxy routes its internal messages (including MITM TLS handshake failures) through this logger.
+// We forward only handshake/TLS/connection-error lines into the diagnostic buffer, so the log shows
+// WHY a decrypted host (e.g. gs-loc.apple.com) never reaches the HTTP handler: a certificate rejection
+// from a pinned host looks like "Cannot handshake client ... remote error: tls: bad certificate".
+type proxyLogger struct{}
+
+func (proxyLogger) Printf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	low := strings.ToLower(msg)
+	for _, kw := range []string{"handshake", "certificate", "tls:", "cannot", "reset", "refused", "eof", "error", "gs-loc", "wloc"} {
+		if strings.Contains(low, kw) {
+			logEvent("[proxy] " + msg)
+			return
+		}
+	}
 }
 
 //export golocationspoofer_drainlogs
@@ -129,7 +146,8 @@ func golocationspoofer_startproxy(certData *C.char, keyData *C.char, lat C.doubl
 	}
 
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.Verbose = false
+	proxy.Verbose = true
+	proxy.Logger = proxyLogger{}
 
 	if globalCACert != nil {
 		setupMITM(proxy, globalCACert)
