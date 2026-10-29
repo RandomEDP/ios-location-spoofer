@@ -1,0 +1,98 @@
+# Builds Location Spoofer on GitHub's Macs.
+# - Every push to main: checks it compiles (unsigned, no Apple account needed).
+# - Run manually ("Run workflow") with TestFlight ticked: signs with the App Store Connect API key and uploads to
+#   TestFlight. Needs repository secrets APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (same as Gaffer).
+# The Xcode project is generated from project.yml on every build; the committed .xcodeproj is not used.
+name: iOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: Upload a build to TestFlight
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the newest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: GoSpoofer/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the Go spoofing library
+        run: cd GoSpoofer && chmod +x make.sh && ./make.sh
+
+      # The .a is linked through OTHER_LDFLAGS/LIBRARY_SEARCH_PATHS in project.yml and is excluded from the sources,
+      # so it never lands in the app bundle (the problem HACKS.md describes) and no hand-patching is needed.
+      - name: Generate the Xcode project
+        run: brew install xcodegen && xcodegen generate
+
+      - name: Check it compiles (unsigned)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.testflight) }}
+        run: |
+          set -o pipefail
+          xcodebuild -project location-spoofer.xcodeproj -scheme location-spoofer -configuration Release \
+            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build 2>&1 \
+            | tee "$RUNNER_TEMP/build.log" | tail -n 40 \
+            || { echo "--- compiler errors"; grep -E "error:" "$RUNNER_TEMP/build.log" | sort -u | head -40; exit 1; }
+
+      - name: Note the signing certificates the account already has
+        if: github.event_name == 'workflow_dispatch' && inputs.testflight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: node scripts/asc-certs.mjs list > "$RUNNER_TEMP/certs-before.txt"
+
+      - name: Sign and upload to TestFlight
+        if: github.event_name == 'workflow_dispatch' && inputs.testflight
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          for v in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!v}" ]; then echo "::error::Repository secret $v is missing."; exit 1; fi
+          done
+          KEY="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          xcodebuild -project location-spoofer.xcodeproj -scheme location-spoofer -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" archive "${AUTH[@]}" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" | tail -n 60
+          sed "s/TEAM_ID/$APPLE_TEAM_ID/" ios/ExportOptions.plist > "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}"
+          echo "Uploaded build ${{ github.run_number }}. It appears in TestFlight once Apple finishes processing, usually 5 to 15 minutes."
+
+      # Each signed build makes Xcode create a certificate on this throwaway Mac; Apple caps how many an account holds,
+      # so the one this build made is revoked again. Nothing that existed before the build is touched.
+      - name: Revoke the certificate this build created
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.testflight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          [ -s "$RUNNER_TEMP/certs-before.txt" ] || { echo "No list from before the build, so nothing is revoked."; exit 0; }
+          node scripts/asc-certs.mjs revoke-new "$RUNNER_TEMP/certs-before.txt"
