@@ -102,7 +102,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
         settings.ipv4Settings = ipv4Settings
 
-        let dnsSettings = NEDNSSettings(servers: ["223.5.5.5", "114.114.114.114"])
+        // Cloudflare and Google (the original author's choice). A fork had switched these to Chinese resolvers.
+        let dnsSettings = NEDNSSettings(servers: ["1.1.1.1", "8.8.8.8"])
         settings.dnsSettings = dnsSettings
 
         settings.mtu = 1500

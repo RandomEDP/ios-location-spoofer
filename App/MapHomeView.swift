@@ -466,12 +466,16 @@ struct MapHomeView: View {
                 Text("⑥ Turn Location Services back on").font(.body)
             }
             .padding()
+            Text("Stay indoors with Wi-Fi on: when GPS has a fix, iOS ignores Wi-Fi location. Keep the VPN on while you want the fake location; turn it off with Disable.\n\nIf it doesn't move (common on iOS 26): turn Location Services off, restart the iPhone, open this app and tap Set as Location again, then turn Location Services on.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Spacer()
             Button("Done") {
                 showRestartLocationGuide = false
                 // pending → on
                 let name = UserDefaults.standard.string(forKey: "currentLocationName") ?? ""
-                DiagLog.add("User tapped [Done]: name=\(name), state→on, will stop VPN")
+                DiagLog.add("User tapped [Done]: name=\(name), state→on, VPN left on")
                 if !name.isEmpty {
                     spoofingState = .on(name: name)
                     // 镜头移到伪装位置,用户直观看到"已生效"
@@ -485,9 +489,9 @@ struct MapHomeView: View {
                         }
                     }
                 }
-                // 定位已进系统缓存焊死,关 VPN 恢复全手机网络;伪装位置由 iOS 缓存维持,不受影响。
-                // 状态卡 .on 独立于 vpnConnected(全局观察者只刷 vpnStatus/vpnConnected,不重置 spoofingState)。
-                ContentView.vpnManager?.connection.stopVPNTunnel()
+                // The VPN is now left on. Turning it off here relied on iOS keeping the fake fix in its cache, which
+                // iOS 26 doesn't reliably do: the next Wi-Fi lookup went straight to Apple and the real location came
+                // back. While the VPN is on, every lookup is answered with the fake location. "Disable" turns it off.
             }
             .font(.headline)
             .frame(maxWidth: .infinity)

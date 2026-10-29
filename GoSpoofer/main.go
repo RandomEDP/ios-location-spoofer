@@ -23,8 +23,8 @@ import (
 
 	"github.com/elazarl/goproxy"
 	pb "golocationspoofer/pb"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 //#cgo CFLAGS: -DGOOS_ios -DNDEBUG
@@ -158,6 +158,7 @@ func golocationspoofer_startproxy(certData *C.char, keyData *C.char, lat C.doubl
 	}()
 
 	log.Printf("Proxy server started on 127.0.0.1:8888")
+	logEvent(fmt.Sprintf("Proxy started on 127.0.0.1:8888, spoofing=%v at (%.6f, %.6f), MITM=%v", spoofingEnabled, spoofLat, spoofLon, globalCACert != nil))
 	return C.uintptr_t(h)
 }
 
@@ -190,6 +191,34 @@ func golocationspoofer_getcoords() (lat, lon C.double, enabled C.int) {
 	return C.double(spoofLat), C.double(spoofLon), e
 }
 
+// Hosts iOS sends Wi-Fi location lookups (/clls/wloc) to. Newer iOS versions also use gsp-ssl.ls.apple.com.
+func isLocationHost(host string) bool {
+	switch strings.ToLower(strings.Split(host, ":")[0]) {
+	case "gs-loc.apple.com", "gs-loc-cn.apple.com", "gsp-ssl.ls.apple.com":
+		return true
+	}
+	return false
+}
+
+// Apple hosts seen through the proxy this session, so the diagnostics show whether the phone's location
+// service is using the proxy at all, and which hosts it talks to. Each host is logged once per session.
+var seenAppleHosts = map[string]bool{}
+var seenAppleHostsMu sync.Mutex
+
+func noteAppleHost(host string, how string) {
+	hostname := strings.ToLower(strings.Split(host, ":")[0])
+	if !strings.HasSuffix(hostname, ".apple.com") && !strings.HasSuffix(hostname, ".icloud.com") {
+		return
+	}
+	seenAppleHostsMu.Lock()
+	first := !seenAppleHosts[hostname]
+	seenAppleHosts[hostname] = true
+	seenAppleHostsMu.Unlock()
+	if first {
+		logEvent(fmt.Sprintf("Apple host via proxy: %s (%s)", hostname, how))
+	}
+}
+
 func setupMITM(proxy *goproxy.ProxyHttpServer, cert *tls.Certificate) {
 	customCaMitm := &goproxy.ConnectAction{
 		Action:    goproxy.ConnectMitm,
@@ -197,11 +226,12 @@ func setupMITM(proxy *goproxy.ProxyHttpServer, cert *tls.Certificate) {
 	}
 
 	var customMitmHandler goproxy.FuncHttpsHandler = func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-		hostname := strings.Split(host, ":")[0]
-		if hostname == "gs-loc.apple.com" || hostname == "gs-loc-cn.apple.com" {
+		if isLocationHost(host) {
 			log.Printf("Intercepting location request: %s", host)
+			logEvent(fmt.Sprintf("CONNECT %s -> decrypting (location host)", host))
 			return customCaMitm, host
 		}
+		noteAppleHost(host, "HTTPS, passed through")
 		return goproxy.OkConnect, host
 	}
 
@@ -261,10 +291,15 @@ a{color:#007AFF;text-decoration:none}
 
 func setupLocationSpoofing(proxy *goproxy.ProxyHttpServer) {
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		if req.Host == "gs-loc.apple.com" || req.Host == "gs-loc-cn.apple.com" {
+		if isLocationHost(req.Host) {
 			if req.URL.Path == "/clls/wloc" && req.Method == "POST" {
 				return handleLocationRequest(req)
 			}
+			logEvent(fmt.Sprintf("Location host request not rewritten: %s %s%s", req.Method, req.Host, req.URL.Path))
+			return req, nil
+		}
+		if req.URL.Scheme == "http" {
+			noteAppleHost(req.Host, "plain HTTP")
 		}
 		return req, nil
 	})
@@ -414,6 +449,7 @@ func SerializeProto(p proto.Message, initial []byte) ([]byte, error) {
 }
 
 func main() {}
+
 // rewriteAppleWLocCoords 在 AppleWLoc 原始 wire bytes 上扫描所有 WifiDevices(tag=2 LEN),
 // 对每个 WifiDevice 递归调用 rewriteWifiDevice 把 lat/lon 改成 spoof 坐标。
 // 其他顶层字段(NumCellResults/CellTowerResponse/DeviceType/未知 tag 等)wire 字节级原样保留。
@@ -427,7 +463,15 @@ func rewriteAppleWLocCoords(payload []byte, lat, lon int64) ([]byte, int) {
 		if tagLen < 0 {
 			return payload, modified
 		}
-		if num == 2 && typ == protowire.BytesType {
+		if num == 3 || num == 4 || num == 33 {
+			// Request-only fields (NumCellResults, NumWifiResults, DeviceType). The response is built from the
+			// request, and the original author's version dropped these too, as Apple's real responses don't carry them.
+			n := protowire.ConsumeFieldValue(num, typ, b[tagLen:])
+			if n < 0 {
+				return payload, modified
+			}
+			b = b[tagLen+n:]
+		} else if num == 2 && typ == protowire.BytesType {
 			wdBytes, valLen := protowire.ConsumeBytes(b[tagLen:])
 			if valLen < 0 {
 				return payload, modified
@@ -484,14 +528,12 @@ func rewriteWifiDevice(wd []byte, lat, lon int64) ([]byte, int) {
 		}
 	}
 	if !locationSeen {
-		var loc []byte
-		loc = protowire.AppendTag(loc, 1, protowire.VarintType)
-		loc = protowire.AppendVarint(loc, uint64(lat))
-		loc = protowire.AppendTag(loc, 2, protowire.VarintType)
-		loc = protowire.AppendVarint(loc, uint64(lon))
+		// Requests normally carry no location, so build a complete one (lat/lon plus accuracy and the
+		// other fields Apple's responses include) rather than lat/lon alone.
+		loc, sub := rewriteLocation(nil, lat, lon)
 		out = protowire.AppendTag(out, 2, protowire.BytesType)
 		out = protowire.AppendBytes(out, loc)
-		modified += 2
+		modified += sub
 	}
 	return out, modified
 }
@@ -504,12 +546,14 @@ func rewriteLocation(loc []byte, lat, lon int64) ([]byte, int) {
 	modified := 0
 	latSeen := false
 	lonSeen := false
+	seen := map[protowire.Number]bool{}
 	b := loc
 	for len(b) > 0 {
 		num, typ, tagLen := protowire.ConsumeTag(b)
 		if tagLen < 0 {
 			return loc, modified
 		}
+		seen[num] = true
 		if num == 1 && typ == protowire.VarintType {
 			latSeen = true
 			_, valLen := protowire.ConsumeVarint(b[tagLen:])
@@ -549,6 +593,25 @@ func rewriteLocation(loc []byte, lat, lon int64) ([]byte, int) {
 		out = protowire.AppendVarint(out, uint64(lon))
 		modified++
 	}
+	// Fields a real Apple answer always has. Without horizontal accuracy (3) the phone may treat the
+	// answer as unusable. Values are the original author's: 39 m accuracy, 530 m altitude, etc.
+	for _, f := range locationDefaults {
+		if !seen[f.num] {
+			out = protowire.AppendTag(out, f.num, protowire.VarintType)
+			out = protowire.AppendVarint(out, uint64(f.val))
+		}
+	}
 	return out, modified
 }
 
+var locationDefaults = []struct {
+	num protowire.Number
+	val int64
+}{
+	{3, 39},   // horizontal accuracy (m)
+	{4, 3},    // unknownValue4
+	{5, 530},  // altitude
+	{6, 1000}, // vertical accuracy
+	{11, 63},  // motion activity type
+	{12, 467}, // motion activity confidence
+}
